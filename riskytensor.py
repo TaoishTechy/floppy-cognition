@@ -1,13 +1,13 @@
 """riskytensor Phase-3+ — float32 + int8_per_row + zlib + convert from .pt
 
-Implements Consolidated Blueprint v4.0 Phases 0–3 plus convert helpers:
-- 64-byte header, deterministic manifest, SHA-256 checks
-- float32 (exact) and int8_per_row (train2.export math) storage
-- optional per-tensor zlib compression
-- convert_pt() / CLI convert for laser .pt → .riskytensor
-- load() returns dequantized float32; load_raw() exposes scales / int8
-
-No pickle / eval / exec in the parser. Stdlib + zlib only.
+Header layout (88 bytes):
+  0:7   magic b"RISKY4\n"
+  7:9   version u16
+  9:11  header_len u16 (=88)
+  11:19 manifest_len u64
+  19:51 manifest SHA-256 (32)
+  51:83 payload SHA-256 (32)
+  83:88 reserved
 """
 import struct
 import json
@@ -18,7 +18,7 @@ import zlib
 
 MAGIC = b"RISKY4\n"
 VERSION = 4
-HEADER_LEN = 64
+HEADER_LEN = 88  # was 64 — too small for two SHA-256 digests
 
 def _sha256(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
@@ -164,7 +164,10 @@ def info(path: str) -> dict:
         raise ValueError("riskytensor: unsupported version %d" % version)
     header_len = struct.unpack_from("<H", header, 9)[0]
     if header_len != HEADER_LEN:
-        raise ValueError("riskytensor: unexpected header_len %d" % header_len)
+        raise ValueError(
+            "riskytensor: unexpected header_len %d (need %d; re-convert with fixed riskytensor)"
+            % (header_len, HEADER_LEN)
+        )
     manifest_len = struct.unpack_from("<Q", header, 11)[0]
     manifest_sha = header[19:51]
     payload_sha = header[51:83]
@@ -185,6 +188,8 @@ def info(path: str) -> dict:
     return manifest
 
 def _write_header(manifest_bytes: bytes, payload_sha: bytes) -> bytes:
+    if len(payload_sha) != 32:
+        raise ValueError("payload_sha must be 32 bytes")
     manifest_sha = _sha256(manifest_bytes)
     header = bytearray(HEADER_LEN)
     header[0:7] = MAGIC
@@ -193,6 +198,7 @@ def _write_header(manifest_bytes: bytes, payload_sha: bytes) -> bytes:
     struct.pack_into("<Q", header, 11, len(manifest_bytes))
     header[19:51] = manifest_sha
     header[51:83] = payload_sha
+    # 83:88 reserved (zeros)
     return bytes(header)
 
 # ---------------------------------------------------------------------------
@@ -200,15 +206,7 @@ def _write_header(manifest_bytes: bytes, payload_sha: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 def save(state_dict, path, recipe=None, compress=False, metadata=None):
-    """Save state_dict to .riskytensor.
-
-    recipe:
-      None / "int8_per_row" -> 2-D use int8_per_row, 1-D stay float32
-      "float32"             -> everything float32
-      dict[name, storage]   -> per-tensor override
-    compress: try zlib per tensor (kept only when smaller)
-    metadata: optional dict merged into manifest["metadata"]
-    """
+    """Save state_dict to .riskytensor."""
     if not isinstance(state_dict, dict):
         raise TypeError("state_dict must be a dict")
 
@@ -307,7 +305,7 @@ def load(path):
         meta = tensors_meta[name]
         off = meta["offset"]
         comp_len = meta["compressed_length"]
-        stored = payload[off:off+comp_len]
+        stored = payload[off:off + comp_len]
         if len(stored) != comp_len:
             raise ValueError("riskytensor: truncated tensor data for %s" % name)
 
@@ -347,7 +345,7 @@ def load_raw(path):
     for name, meta in manifest.get("tensors", {}).items():
         off = meta["offset"]
         comp_len = meta["compressed_length"]
-        stored = payload[off:off+comp_len]
+        stored = payload[off:off + comp_len]
         raw = _decompress(stored, meta.get("compression", "none"), meta["length"])
         shape = tuple(meta["shape"])
         storage = meta.get("storage", "float32")
@@ -388,25 +386,10 @@ def verify(path):
 # ---------------------------------------------------------------------------
 
 def convert_pt(pt_path, out_path=None, recipe=None, compress=False):
-    """Convert a laser / train2 .pt checkpoint to .riskytensor.
-
-    Expected .pt layout (train2 save_model):
-        {"cfg": {...}, "sd": state_dict}
-    or a plain state_dict.
-
-    Returns the number of bytes written.
-    """
+    """Convert a laser / train2 .pt checkpoint to .riskytensor."""
     _try_import_backends()
-    if _Tensor is None:
-        # fall back to laser.load if available
-        try:
-            import laser
-            ck = laser.load(pt_path)
-        except Exception as e:
-            raise RuntimeError("convert_pt requires laser (or a loadable .pt): %s" % e)
-    else:
-        import laser
-        ck = laser.load(pt_path)
+    import laser
+    ck = laser.load(pt_path)
 
     if isinstance(ck, dict) and "sd" in ck:
         sd = ck["sd"]
@@ -429,7 +412,6 @@ def convert_pt(pt_path, out_path=None, recipe=None, compress=False):
     return n
 
 def convert(path, out_path=None, recipe=None, compress=False):
-    """Generic convert entry point. Currently only .pt is supported."""
     lower = path.lower()
     if lower.endswith(".pt") or lower.endswith(".pth"):
         return convert_pt(path, out_path=out_path, recipe=recipe, compress=compress)
