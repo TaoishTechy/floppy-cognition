@@ -1,20 +1,20 @@
-"""riskytensor Phase-2 — float32 + int8_per_row save/load.
+"""riskytensor Phase-3 — float32 + int8_per_row + optional zlib.
 
-Implements Consolidated Blueprint v4.0 Phases 0–2:
+Implements Consolidated Blueprint v4.0 Phases 0–3:
 - 64-byte header, deterministic manifest, SHA-256 checks
-- float32 storage (exact)
-- int8_per_row storage (same per-row scale + clip math as train2.export)
-- load() returns dequantized float32 Tensors
-- load_raw() returns (int8 bytes, scales) for int8 tensors
+- float32 (exact) and int8_per_row (train2.export math) storage
+- optional per-tensor zlib compression
+- payload SHA is over *decompressed* bytes
+- load() returns dequantized float32; load_raw() exposes scales / int8
 
-No pickle / eval / exec. Parser is pure stdlib.
+No pickle / eval / exec. Parser is pure stdlib (+ zlib).
 """
 import struct
 import json
 import hashlib
 import os
 import sys
-import math
+import zlib
 
 MAGIC = b"RISKY4\n"
 VERSION = 4
@@ -48,12 +48,11 @@ def _try_import_backends():
         _Tensor = None
 
 def _as_float_list_and_shape(obj):
-    """Return (flat list of float, shape tuple)."""
     _try_import_backends()
     if _Tensor is not None and isinstance(obj, _Tensor):
         arr = obj._arr
         shape = tuple(obj.shape)
-        if hasattr(arr, "astype") and arr.dtype.name != "float32":
+        if hasattr(arr, "astype") and getattr(arr.dtype, "name", "") != "float32":
             arr = arr.astype("float32")
         return list(arr._data) if hasattr(arr, "_data") else list(arr.tolist()), shape
     if _np is not None and isinstance(obj, _np.ndarray):
@@ -91,30 +90,24 @@ def _from_floats(vals, shape, prefer_tensor=True):
     return [list(vals[i*cols:(i+1)*cols]) for i in range(rows)]
 
 # ---------------------------------------------------------------------------
-# Quantization helpers (identical math to train2.export / quantized_copy)
+# Quantization (identical to train2.export)
 # ---------------------------------------------------------------------------
 
 def _quantize_int8_per_row(flat, shape):
-    """Return (blob_bytes, scales_list).
-    blob layout: for each row: float32 scale + cols int8 values.
-    """
     if len(shape) != 2:
         raise ValueError("int8_per_row requires 2-D tensor, got shape %s" % (shape,))
     rows, cols = shape
-    scales = []
     parts = []
     for r in range(rows):
         row = flat[r*cols:(r+1)*cols]
         max_abs = max(abs(x) for x in row) if row else 0.0
         scale = max(max_abs / 127.0, 1e-8)
-        scales.append(scale)
         q = [max(-127, min(127, int(round(x / scale)))) for x in row]
         parts.append(struct.pack("<f", scale))
         parts.append(struct.pack("<%db" % cols, *q))
-    return b"".join(parts), scales
+    return b"".join(parts)
 
 def _dequantize_int8_per_row(blob, shape):
-    """Return flat list of dequantized floats."""
     rows, cols = shape
     vals = []
     off = 0
@@ -132,6 +125,30 @@ def _float32_bytes(flat):
 def _float32_from_bytes(data):
     n = len(data) // 4
     return list(struct.unpack("<%df" % n, data))
+
+# ---------------------------------------------------------------------------
+# Compression helpers
+# ---------------------------------------------------------------------------
+
+def _maybe_compress(raw: bytes, use_zlib: bool):
+    """Return (stored_bytes, compression_name, raw_length)."""
+    if not use_zlib:
+        return raw, "none", len(raw)
+    compressed = zlib.compress(raw, level=6)
+    # Only keep compression if it actually helps
+    if len(compressed) < len(raw):
+        return compressed, "zlib", len(raw)
+    return raw, "none", len(raw)
+
+def _decompress(stored: bytes, compression: str, raw_length: int) -> bytes:
+    if compression == "none":
+        return stored
+    if compression == "zlib":
+        raw = zlib.decompress(stored)
+        if len(raw) != raw_length:
+            raise ValueError("riskytensor: decompressed length mismatch")
+        return raw
+    raise ValueError("riskytensor: unknown compression %r" % compression)
 
 # ---------------------------------------------------------------------------
 # Header / manifest
@@ -184,13 +201,15 @@ def _write_header(manifest_bytes: bytes, payload_sha: bytes) -> bytes:
 # Public API
 # ---------------------------------------------------------------------------
 
-def save(state_dict, path, recipe=None):
+def save(state_dict, path, recipe=None, compress=False):
     """Save state_dict.
 
     recipe:
-      None or "int8_per_row" -> 2-D tensors use int8_per_row, 1-D stay float32
-      "float32"              -> everything float32
-      dict[name, storage]    -> per-tensor override
+      None / "int8_per_row" -> 2-D use int8_per_row, 1-D stay float32
+      "float32"             -> everything float32
+      dict[name, storage]   -> per-tensor override
+
+    compress: if True, try zlib on each tensor blob (kept only when smaller).
     """
     if not isinstance(state_dict, dict):
         raise TypeError("state_dict must be a dict")
@@ -203,7 +222,8 @@ def save(state_dict, path, recipe=None):
         exceptions = recipe
 
     tensors_meta = {}
-    blobs = []
+    stored_blobs = []          # what is written to the payload
+    raw_for_hash = []          # decompressed bytes (for payload SHA)
     offset = 0
 
     for name in sorted(state_dict.keys()):
@@ -212,51 +232,47 @@ def save(state_dict, path, recipe=None):
 
         storage = exceptions.get(name, default_storage)
         if storage == "int8_per_row" and len(shape) != 2:
-            storage = "float32"          # 1-D cannot be int8_per_row
+            storage = "float32"
 
         if storage == "int8_per_row":
-            data, scales = _quantize_int8_per_row(flat, shape)
-            meta = {
-                "shape": list(shape),
-                "dtype": "float32",
-                "storage": "int8_per_row",
-                "scale_dtype": "float32",
-                "offset": offset,
-                "length": len(data),
-                "compressed_length": len(data),
-                "compression": "none",
-                "sha256": _sha256_hex(data),
-            }
+            raw = _quantize_int8_per_row(flat, shape)
         else:
-            data = _float32_bytes(flat)
-            meta = {
-                "shape": list(shape),
-                "dtype": "float32",
-                "storage": "float32",
-                "offset": offset,
-                "length": len(data),
-                "compressed_length": len(data),
-                "compression": "none",
-                "sha256": _sha256_hex(data),
-            }
+            raw = _float32_bytes(flat)
+
+        stored, compression, raw_len = _maybe_compress(raw, compress)
+
+        meta = {
+            "shape": list(shape),
+            "dtype": "float32",
+            "storage": storage,
+            "offset": offset,
+            "length": raw_len,                 # decompressed length
+            "compressed_length": len(stored),
+            "compression": compression,
+            "sha256": _sha256_hex(raw),        # SHA of decompressed data
+        }
+        if storage == "int8_per_row":
+            meta["scale_dtype"] = "float32"
 
         tensors_meta[name] = meta
-        blobs.append(data)
-        offset += len(data)
+        stored_blobs.append(stored)
+        raw_for_hash.append(raw)
+        offset += len(stored)
 
-    payload = b"".join(blobs)
-    payload_sha = _sha256(payload)
+    payload = b"".join(stored_blobs)
+    # Blueprint: payload_sha is over the *decompressed* concatenation
+    payload_sha = _sha256(b"".join(raw_for_hash))
 
     manifest = {
         "format": "riskytensor",
         "version": VERSION,
-        "created_by": "riskytensor Phase-2",
+        "created_by": "riskytensor Phase-3",
         "tensors": tensors_meta,
         "quantization": {
             "default": default_storage,
             "exceptions": exceptions,
         },
-        "metadata": {},
+        "metadata": {"compress": bool(compress)},
     }
 
     manifest_bytes = json.dumps(
@@ -284,42 +300,43 @@ def load(path):
         f.seek(HEADER_LEN + manifest_len)
         payload = f.read()
 
-    if _sha256(payload) != bytes.fromhex(manifest["_payload_sha"]):
-        raise ValueError("riskytensor: payload SHA-256 mismatch")
-
+    # Reconstruct decompressed payload for the global SHA check
+    raw_parts = []
     out = {}
     for name in sorted(tensors_meta.keys()):
         meta = tensors_meta[name]
         off = meta["offset"]
-        length = meta["length"]
-        data = payload[off:off+length]
-        if len(data) != length:
+        comp_len = meta["compressed_length"]
+        stored = payload[off:off+comp_len]
+        if len(stored) != comp_len:
             raise ValueError("riskytensor: truncated tensor data for %s" % name)
-        if _sha256_hex(data) != meta["sha256"]:
+
+        raw = _decompress(stored, meta.get("compression", "none"), meta["length"])
+        if _sha256_hex(raw) != meta["sha256"]:
             raise ValueError("riskytensor: SHA-256 mismatch for tensor %s" % name)
+        raw_parts.append(raw)
 
         shape = tuple(meta["shape"])
         storage = meta.get("storage", "float32")
 
         if storage == "float32":
-            vals = _float32_from_bytes(data)
+            vals = _float32_from_bytes(raw)
         elif storage == "int8_per_row":
-            vals = _dequantize_int8_per_row(data, shape)
+            vals = _dequantize_int8_per_row(raw, shape)
         else:
             raise NotImplementedError(
                 "riskytensor: unsupported storage %r for %s" % (storage, name)
             )
-
         out[name] = _from_floats(vals, shape, prefer_tensor=True)
+
+    # Global payload SHA (over decompressed concatenation)
+    if _sha256(b"".join(raw_parts)) != bytes.fromhex(manifest["_payload_sha"]):
+        raise ValueError("riskytensor: payload SHA-256 mismatch")
+
     return out
 
 def load_raw(path):
-    """Return dict[name, info] for debugging / re-quantization.
-
-    For float32 tensors: {"storage": "float32", "data": bytes, "shape": tuple}
-    For int8_per_row:   {"storage": "int8_per_row", "blob": bytes,
-                         "shape": tuple, "scales": list[float], "int8": list[list[int]]}
-    """
+    """Return per-tensor raw info (after decompression)."""
     manifest = info(path)
     with open(path, "rb") as f:
         header = f.read(HEADER_LEN)
@@ -330,34 +347,32 @@ def load_raw(path):
     out = {}
     for name, meta in manifest.get("tensors", {}).items():
         off = meta["offset"]
-        length = meta["length"]
-        data = payload[off:off+length]
+        comp_len = meta["compressed_length"]
+        stored = payload[off:off+comp_len]
+        raw = _decompress(stored, meta.get("compression", "none"), meta["length"])
         shape = tuple(meta["shape"])
         storage = meta.get("storage", "float32")
 
-        if storage == "float32":
-            out[name] = {"storage": "float32", "data": data, "shape": shape}
-        elif storage == "int8_per_row":
+        entry = {
+            "storage": storage,
+            "shape": shape,
+            "compression": meta.get("compression", "none"),
+            "raw": raw,
+        }
+        if storage == "int8_per_row":
             rows, cols = shape
-            scales = []
-            int8_rows = []
+            scales, int8_rows = [], []
             pos = 0
             for _ in range(rows):
-                scale = struct.unpack_from("<f", data, pos)[0]
+                scale = struct.unpack_from("<f", raw, pos)[0]
                 pos += 4
-                q = list(struct.unpack_from("<%db" % cols, data, pos))
+                q = list(struct.unpack_from("<%db" % cols, raw, pos))
                 pos += cols
                 scales.append(scale)
                 int8_rows.append(q)
-            out[name] = {
-                "storage": "int8_per_row",
-                "blob": data,
-                "shape": shape,
-                "scales": scales,
-                "int8": int8_rows,
-            }
-        else:
-            out[name] = {"storage": storage, "data": data, "shape": shape}
+            entry["scales"] = scales
+            entry["int8"] = int8_rows
+        out[name] = entry
     return out
 
 def verify(path):
@@ -380,6 +395,7 @@ if __name__ == "__main__":
         print("  python3 -I riskytensor.py save-empty <file>")
         print("  python3 -I riskytensor.py roundtrip-demo <file>")
         print("  python3 -I riskytensor.py roundtrip-int8 <file>")
+        print("  python3 -I riskytensor.py roundtrip-zlib <file>")
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -405,26 +421,28 @@ if __name__ == "__main__":
         print("wrote %d bytes (float32)" % n)
         loaded = load(sys.argv[2])
         print("loaded keys:", sorted(loaded.keys()))
-        for k, v in loaded.items():
-            print(" ", k, "->", v)
         print("verify:", "OK" if verify(sys.argv[2]) else "FAIL")
 
     elif cmd == "roundtrip-int8" and len(sys.argv) == 3:
         demo = {
             "emb.weight": [[0.1, 0.2, -0.3], [0.4, -0.5, 0.6]],
             "blocks.0.q.weight": [[1.0, -1.0], [0.5, -0.5]],
-            "nf.g": [1.0, 1.0, 1.0],          # 1-D stays float32
+            "nf.g": [1.0, 1.0, 1.0],
         }
-        n = save(demo, sys.argv[2])          # default = int8_per_row for 2-D
-        print("wrote %d bytes (int8_per_row for 2-D)" % n)
-        loaded = load(sys.argv[2])
-        print("loaded keys:", sorted(loaded.keys()))
-        for k, v in loaded.items():
-            print(" ", k, "->", v)
-        raw = load_raw(sys.argv[2])
-        for k, info in raw.items():
-            print(" raw", k, info["storage"],
-                  ("scales=" + str(info.get("scales"))) if "scales" in info else "")
+        n = save(demo, sys.argv[2])
+        print("wrote %d bytes (int8_per_row)" % n)
+        print("verify:", "OK" if verify(sys.argv[2]) else "FAIL")
+
+    elif cmd == "roundtrip-zlib" and len(sys.argv) == 3:
+        demo = {
+            "emb.weight": [[0.1, 0.2, -0.3], [0.4, -0.5, 0.6]] * 20,
+            "blocks.0.q.weight": [[1.0, -1.0], [0.5, -0.5]] * 10,
+            "nf.g": [1.0] * 32,
+        }
+        n1 = save(demo, sys.argv[2] + ".raw", compress=False)
+        n2 = save(demo, sys.argv[2], compress=True)
+        print("raw      %d bytes" % n1)
+        print("zlib     %d bytes" % n2)
         print("verify:", "OK" if verify(sys.argv[2]) else "FAIL")
 
     else:
