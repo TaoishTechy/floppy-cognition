@@ -8,34 +8,32 @@
 |------|-------------|--------|
 | README.md | 2 KB | Complete |
 | LICENSE | 1 KB | MIT |
-| bumpy.py | 37 KB | Full numpy-replacement |
-| train2.py | 15 KB | Full model + train + eval + export |
-| laser.py | ~1 KB (marker) | Full 49 KB source ready locally |
-| gen2.py | ~9 KB | **Finished** – multi-category generator (geo, math, animals, language, science, facts, unknown) with varied wordings |
-| riskytensor.py | ~3 KB | Phase-0 skeleton (header + manifest + info/verify) |
+| bumpy.py | 37 KB | Full |
+| train2.py | 15 KB | Full |
+| laser.py | marker only | Full 49 KB source still local |
+| gen2.py | ~9 KB | Finished multi-category generator |
+| riskytensor.py | ~11 KB | **Phase-1 complete** (float32 save/load + header/manifest/SHA-256) |
 | STATUS.md | this file | Current |
 | docs/ | | Blueprint summaries |
-
-## Size check
-
-All committed content remains well under the 1.4 MB hard limit.
 
 ## What works right now
 
 ```bash
-python3 -I gen2.py                  # prints sample facts
 python3 -I riskytensor.py save-empty test.riskytensor
-python3 -I riskytensor.py info test.riskytensor
+python3 -I riskytensor.py roundtrip-demo demo.riskytensor
+python3 -I riskytensor.py info demo.riskytensor
+python3 -I riskytensor.py verify demo.riskytensor
+python3 -I gen2.py
 ```
 
 ## Still required for a full train run
 
-Replace the laser.py marker with the complete 49 KB implementation. After that:
+Replace the laser.py marker with the complete implementation. After that:
 
 ```bash
 python3 -I train2.py train 0.1 smoke.pt
 ```
 
-should progress past imports and begin training on the gen2 fact pools.
+can proceed.
 
-*Last updated after finished gen2.py.*
+*Last updated after riskytensor Phase-1.*
