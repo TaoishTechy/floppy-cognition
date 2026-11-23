@@ -68,7 +68,8 @@ class Block(nn.Module):
         self.f2 = nn.Linear(c.HID, c.D, bias=False)
 
     def forward(self, x):
-        B, T, D = x        H = self.c.H
+        B, T, D = x.shape
+        H = self.c.H
         h = self.n1(x)
         sp = lambda t: t.view(B, T, H, D // H).transpose(1, 2)
         a = F.scaled_dot_product_attention(sp(self.q(h)), sp(self.k(h)), sp(self.v(h)), is_causal=True)
@@ -338,18 +339,15 @@ def load_model(path):
         return load_old_bin(path)
     if lower.endswith('.riskytensor') and _HAS_RISKY:
         sd = riskytensor.load(path)
-        # recover cfg from metadata if present, else assume default
         info = riskytensor.info(path)
         cfg_dict = info.get('metadata', {}).get('cfg', {})
         if not cfg_dict:
-            # fall back to shape of emb.weight
             emb = sd.get('emb.weight')
             D = emb.shape[1] if emb is not None else 96
             cfg_dict = {'D': D, 'L': 4, 'H': 4, 'HID': 256}
         m = Model(Cfg(**cfg_dict))
         m.load_state_dict(sd)
         return m
-    # laser / legacy .pt
     ck = torch.load(path, map_location='cpu')
     m = Model(Cfg(**ck['cfg']))
     m.load_state_dict(ck['sd'])
@@ -360,13 +358,7 @@ def save_model(m, path):
     """Save to .riskytensor when possible, otherwise laser .pt."""
     lower = path.lower()
     if lower.endswith('.riskytensor') and _HAS_RISKY:
-        sd = m.state_dict()
-        # attach cfg into metadata via a temporary recipe-less save
-        riskytensor.save(sd, path, recipe=None)
-        # re-open and inject cfg (simple approach: save again with metadata)
-        # For Phase-3 the metadata field is already present; we store cfg there
-        # by a second pass that only updates the manifest would be ideal,
-        # but for simplicity we just rely on shape recovery in load_model.
+        riskytensor.save(m.state_dict(), path, recipe=None)
         return os.path.getsize(path)
     torch.save(dict(cfg=vars(m.c), sd=m.state_dict()), path)
     return os.path.getsize(path)
@@ -416,7 +408,6 @@ def train(minutes, out, start=None, cfg=Cfg(), peak=2e-3, bs=64, log_every=100,
         if el >= total:
             break
 
-        # learning-rate schedule
         warm = min(1.0, (step + 1) / 200)
         if decay_frac is None:
             lr = peak * warm * (0.03 + 0.97 * 0.5 * (1 + math.cos(math.pi * el / total)))
@@ -424,7 +415,6 @@ def train(minutes, out, start=None, cfg=Cfg(), peak=2e-3, bs=64, log_every=100,
             left = (total - el) / (decay_frac * total)
             lr = peak * warm * min(1.0, max(0.0, left))
 
-        # periodic evaluation
         if eval_every and el > (eval_no + 1) * eval_every * 60:
             eval_no += 1
             save_model(model, out)
