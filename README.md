@@ -19,10 +19,10 @@ Outperform Claude-class models on the exact Tiny held-out fact set while remaini
 
 | Module | Role | Status |
 |--------|------|--------|
-| `bumpy.py` | numpy replacement | present |
-| `laser.py` | torch replacement (Tensor + autograd + nn + AdamW) | present |
-| `riskytensor.py` | safetensors / torch.save replacement | blueprint |
-| `train2.py` | model, training, eval, TINY.BIN export | present |
+| `bumpy.py` | numpy replacement | committed |
+| `laser.py` | torch replacement (Tensor + autograd + nn + AdamW) | source ready locally; full commit pending |
+| `riskytensor.py` | safetensors / torch.save replacement | blueprint only |
+| `train2.py` | model, training, eval, TINY.BIN export | committed |
 
 ## Quick start
 
@@ -51,6 +51,10 @@ Copy `TINY.EXE` + `TINY.BIN` to a DOS machine (or emulator) and run.
 - Full model weights (int8 per-row) ~ 380 KB
 
 All numbers are measured, not claimed.
+
+## Current repository state
+
+See [STATUS.md](STATUS.md) for the exact commit inventory and next actions.
 
 ## Licence
 
