@@ -8,7 +8,7 @@
 Optimised for the floppy-cognition stack:
 - riskytensor checkpoint support
 - deterministic seed control
-- clearer progress logging
+- rich progress logging (loss, tokens/s, ETA, sample Q&A)
 - same model architecture and CLI surface as before
 """
 import sys, os, time, math, random, struct, re, collections
@@ -100,7 +100,6 @@ class Model(nn.Module):
 
 # ---------------------------------------------------------------- old TINY.BIN
 def load_old_bin(path, D=96, L=3, HID=192):
-    """Read the version-1 weight file into a model."""
     b = open(path, 'rb').read()
     off = [0]
 
@@ -132,7 +131,6 @@ def load_old_bin(path, D=96, L=3, HID=192):
 
 
 def grow(old, c):
-    """Bigger model that starts with the same function as `old`."""
     m = Model(c)
     with torch.no_grad():
         m.emb.weight.copy_(old.emb.weight)
@@ -160,7 +158,6 @@ _POOL = []
 
 
 def batch(rng, n):
-    """Length-sorted mini-batches to minimise padding waste."""
     if not _POOL:
         ex = []
         for _ in range(n * 32):
@@ -243,7 +240,6 @@ def correct(q, gen, refs, kind=None):
 
 @torch.no_grad()
 def answer_many(model, qs):
-    """Greedy answers, batched by question length."""
     model.eval()
     res = {}
     bylen = collections.defaultdict(list)
@@ -290,7 +286,6 @@ def evaluate(model, show=0):
 
 # ---------------------------------------------------------------- export / checkpoints
 def export(model, path):
-    """Write TINY.BIN (version-2)."""
     c = model.c
     sd = {k: v.float() for k, v in model.state_dict().items()}
     with open(path, 'wb') as f:
@@ -321,7 +316,6 @@ def export(model, path):
 
 
 def quantized_copy(model):
-    """Same model with weights rounded exactly as export()."""
     m = Model(model.c)
     m.load_state_dict(model.state_dict())
     with torch.no_grad():
@@ -333,7 +327,6 @@ def quantized_copy(model):
 
 
 def load_model(path):
-    """Load from .BIN, .riskytensor or laser .pt checkpoint."""
     lower = path.lower()
     if lower.endswith('.bin'):
         return load_old_bin(path)
@@ -355,23 +348,19 @@ def load_model(path):
 
 
 def save_model(m, path):
-    """Save to .riskytensor when possible, otherwise laser .pt."""
     lower = path.lower()
     if lower.endswith('.riskytensor') and _HAS_RISKY:
-        riskytensor.save(m.state_dict(), path, recipe=None)
+        riskytensor.save(m.state_dict(), path, recipe=None,
+                         metadata={'cfg': vars(m.c)})
         return os.path.getsize(path)
     torch.save(dict(cfg=vars(m.c), sd=m.state_dict()), path)
     return os.path.getsize(path)
 
 
 # ---------------------------------------------------------------- training loop
-def train(minutes, out, start=None, cfg=Cfg(), peak=2e-3, bs=64, log_every=100,
+def train(minutes, out, start=None, cfg=Cfg(), peak=2e-3, bs=64, log_every=50,
           resume=None, decay_frac=None, eval_every=0, seed=None):
-    """Train for `minutes` wall-clock time.
-
-    decay_frac=None  -> cosine schedule
-    decay_frac=f     -> constant LR then linear decay over the last fraction f
-    """
+    """Train for `minutes` wall-clock time with rich progress output."""
     if seed is not None:
         torch.manual_seed(int(seed))
         rng = random.Random(int(seed))
@@ -387,7 +376,14 @@ def train(minutes, out, start=None, cfg=Cfg(), peak=2e-3, bs=64, log_every=100,
 
     cfg = model.c
     n_params = sum(p.numel() for p in model.parameters())
-    print('model', cfg, 'parameters', n_params, flush=True)
+    print('=' * 60, flush=True)
+    print('model   ', cfg, flush=True)
+    print('params  ', n_params, flush=True)
+    print('batch   ', bs, flush=True)
+    print('peak lr ', peak, flush=True)
+    print('minutes ', minutes, flush=True)
+    print('out     ', out, flush=True)
+    print('=' * 60, flush=True)
 
     decay = [p for p in model.parameters() if p.dim() == 2]
     other = [p for p in model.parameters() if p.dim() < 2]
@@ -402,6 +398,9 @@ def train(minutes, out, start=None, cfg=Cfg(), peak=2e-3, bs=64, log_every=100,
     run = None
     eval_no = 0
     best_loss = float('inf')
+    tokens_seen = 0
+    last_log_t = t0
+    last_log_step = 0
 
     while True:
         el = time.time() - t0
@@ -436,14 +435,40 @@ def train(minutes, out, start=None, cfg=Cfg(), peak=2e-3, bs=64, log_every=100,
         run = loss_val if run is None else 0.98 * run + 0.02 * loss_val
         if loss_val < best_loss:
             best_loss = loss_val
+        tokens_seen += int(msk.sum().item()) if hasattr(msk, 'sum') else bs * CTX
 
         if step % log_every == 0:
-            print('step %5d  %5.0fs  lr %.5f  loss %.4f  (best %.4f)' %
-                  (step, el, lr, run, best_loss), flush=True)
+            now = time.time()
+            dt = now - last_log_t
+            dstep = step - last_log_step
+            tok_s = (tokens_seen / max(1e-6, now - t0))
+            eta = max(0.0, total - el)
+            print('step %5d | %5.0fs | lr %.5f | loss %.4f (best %.4f) | %.0f tok/s | ETA %.0fs' %
+                  (step, el, lr, run, best_loss, tok_s, eta), flush=True)
+            last_log_t = now
+            last_log_step = step
+
+            # occasional live sample
+            if step % (log_every * 4) == 0:
+                try:
+                    q, a, k = gen2.sample(rng)
+                    pred = answer_many(model, [q]).get(q, '')
+                    print('  sample [%s] Q: %s' % (k, q), flush=True)
+                    print('           A: %s' % a, flush=True)
+                    print('           → %s' % pred, flush=True)
+                except Exception:
+                    pass
 
     save_model(model, out)
-    print('saved', out, 'steps', step, 'time %.0fs  best_loss %.4f' %
-          (time.time() - t0, best_loss), flush=True)
+    elapsed = time.time() - t0
+    print('=' * 60, flush=True)
+    print('saved   ', out, flush=True)
+    print('steps   ', step, flush=True)
+    print('time    ', '%.0fs' % elapsed, flush=True)
+    print('best    ', '%.4f' % best_loss, flush=True)
+    print('tokens  ', tokens_seen, flush=True)
+    print('tok/s   ', '%.0f' % (tokens_seen / max(1e-6, elapsed)), flush=True)
+    print('=' * 60, flush=True)
     return model
 
 
@@ -484,10 +509,11 @@ if __name__ == '__main__':
             eval_every=float(arg('--eval-every', 0)),
             seed=int(arg('--seed')) if arg('--seed') else None,
         )
+        print('\n--- final evaluation ---', flush=True)
         tot, line = evaluate(m, show=0)
-        print('eval (float) %.1f%%  %s' % (100 * tot, line))
-        tot, line = evaluate(quantized_copy(m), show=25)
-        print('eval (8-bit) %.1f%%  %s' % (100 * tot, line))
+        print('eval (float) %.1f%%  %s' % (100 * tot, line), flush=True)
+        tot, line = evaluate(quantized_copy(m), show=15)
+        print('eval (8-bit) %.1f%%  %s' % (100 * tot, line), flush=True)
 
     elif cmd == 'eval':
         m = load_model(sys.argv[2])
