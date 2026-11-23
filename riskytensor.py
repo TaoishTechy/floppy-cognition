@@ -1,13 +1,13 @@
-"""riskytensor Phase-3 — float32 + int8_per_row + optional zlib.
+"""riskytensor Phase-3+ — float32 + int8_per_row + zlib + convert from .pt
 
-Implements Consolidated Blueprint v4.0 Phases 0–3:
+Implements Consolidated Blueprint v4.0 Phases 0–3 plus convert helpers:
 - 64-byte header, deterministic manifest, SHA-256 checks
 - float32 (exact) and int8_per_row (train2.export math) storage
 - optional per-tensor zlib compression
-- payload SHA is over *decompressed* bytes
+- convert_pt() / CLI convert for laser .pt → .riskytensor
 - load() returns dequantized float32; load_raw() exposes scales / int8
 
-No pickle / eval / exec. Parser is pure stdlib (+ zlib).
+No pickle / eval / exec in the parser. Stdlib + zlib only.
 """
 import struct
 import json
@@ -131,11 +131,9 @@ def _float32_from_bytes(data):
 # ---------------------------------------------------------------------------
 
 def _maybe_compress(raw: bytes, use_zlib: bool):
-    """Return (stored_bytes, compression_name, raw_length)."""
     if not use_zlib:
         return raw, "none", len(raw)
     compressed = zlib.compress(raw, level=6)
-    # Only keep compression if it actually helps
     if len(compressed) < len(raw):
         return compressed, "zlib", len(raw)
     return raw, "none", len(raw)
@@ -201,15 +199,15 @@ def _write_header(manifest_bytes: bytes, payload_sha: bytes) -> bytes:
 # Public API
 # ---------------------------------------------------------------------------
 
-def save(state_dict, path, recipe=None, compress=False):
-    """Save state_dict.
+def save(state_dict, path, recipe=None, compress=False, metadata=None):
+    """Save state_dict to .riskytensor.
 
     recipe:
       None / "int8_per_row" -> 2-D use int8_per_row, 1-D stay float32
       "float32"             -> everything float32
       dict[name, storage]   -> per-tensor override
-
-    compress: if True, try zlib on each tensor blob (kept only when smaller).
+    compress: try zlib per tensor (kept only when smaller)
+    metadata: optional dict merged into manifest["metadata"]
     """
     if not isinstance(state_dict, dict):
         raise TypeError("state_dict must be a dict")
@@ -222,8 +220,8 @@ def save(state_dict, path, recipe=None, compress=False):
         exceptions = recipe
 
     tensors_meta = {}
-    stored_blobs = []          # what is written to the payload
-    raw_for_hash = []          # decompressed bytes (for payload SHA)
+    stored_blobs = []
+    raw_for_hash = []
     offset = 0
 
     for name in sorted(state_dict.keys()):
@@ -246,10 +244,10 @@ def save(state_dict, path, recipe=None, compress=False):
             "dtype": "float32",
             "storage": storage,
             "offset": offset,
-            "length": raw_len,                 # decompressed length
+            "length": raw_len,
             "compressed_length": len(stored),
             "compression": compression,
-            "sha256": _sha256_hex(raw),        # SHA of decompressed data
+            "sha256": _sha256_hex(raw),
         }
         if storage == "int8_per_row":
             meta["scale_dtype"] = "float32"
@@ -260,19 +258,22 @@ def save(state_dict, path, recipe=None, compress=False):
         offset += len(stored)
 
     payload = b"".join(stored_blobs)
-    # Blueprint: payload_sha is over the *decompressed* concatenation
     payload_sha = _sha256(b"".join(raw_for_hash))
+
+    meta_out = {"compress": bool(compress)}
+    if metadata:
+        meta_out.update(metadata)
 
     manifest = {
         "format": "riskytensor",
         "version": VERSION,
-        "created_by": "riskytensor Phase-3",
+        "created_by": "riskytensor Phase-3+",
         "tensors": tensors_meta,
         "quantization": {
             "default": default_storage,
             "exceptions": exceptions,
         },
-        "metadata": {"compress": bool(compress)},
+        "metadata": meta_out,
     }
 
     manifest_bytes = json.dumps(
@@ -300,7 +301,6 @@ def load(path):
         f.seek(HEADER_LEN + manifest_len)
         payload = f.read()
 
-    # Reconstruct decompressed payload for the global SHA check
     raw_parts = []
     out = {}
     for name in sorted(tensors_meta.keys()):
@@ -329,7 +329,6 @@ def load(path):
             )
         out[name] = _from_floats(vals, shape, prefer_tensor=True)
 
-    # Global payload SHA (over decompressed concatenation)
     if _sha256(b"".join(raw_parts)) != bytes.fromhex(manifest["_payload_sha"]):
         raise ValueError("riskytensor: payload SHA-256 mismatch")
 
@@ -385,6 +384,58 @@ def verify(path):
         return False
 
 # ---------------------------------------------------------------------------
+# Convert helpers (.pt → .riskytensor)
+# ---------------------------------------------------------------------------
+
+def convert_pt(pt_path, out_path=None, recipe=None, compress=False):
+    """Convert a laser / train2 .pt checkpoint to .riskytensor.
+
+    Expected .pt layout (train2 save_model):
+        {"cfg": {...}, "sd": state_dict}
+    or a plain state_dict.
+
+    Returns the number of bytes written.
+    """
+    _try_import_backends()
+    if _Tensor is None:
+        # fall back to laser.load if available
+        try:
+            import laser
+            ck = laser.load(pt_path)
+        except Exception as e:
+            raise RuntimeError("convert_pt requires laser (or a loadable .pt): %s" % e)
+    else:
+        import laser
+        ck = laser.load(pt_path)
+
+    if isinstance(ck, dict) and "sd" in ck:
+        sd = ck["sd"]
+        cfg = ck.get("cfg", {})
+    else:
+        sd = ck
+        cfg = {}
+
+    if out_path is None:
+        base = os.path.splitext(pt_path)[0]
+        out_path = base + ".riskytensor"
+
+    meta = {}
+    if cfg:
+        meta["cfg"] = cfg
+    meta["source"] = os.path.basename(pt_path)
+
+    n = save(sd, out_path, recipe=recipe, compress=compress, metadata=meta)
+    print("converted %s -> %s  (%d bytes)" % (pt_path, out_path, n))
+    return n
+
+def convert(path, out_path=None, recipe=None, compress=False):
+    """Generic convert entry point. Currently only .pt is supported."""
+    lower = path.lower()
+    if lower.endswith(".pt") or lower.endswith(".pth"):
+        return convert_pt(path, out_path=out_path, recipe=recipe, compress=compress)
+    raise ValueError("riskytensor.convert: unsupported input format %r" % path)
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -396,6 +447,7 @@ if __name__ == "__main__":
         print("  python3 -I riskytensor.py roundtrip-demo <file>")
         print("  python3 -I riskytensor.py roundtrip-int8 <file>")
         print("  python3 -I riskytensor.py roundtrip-zlib <file>")
+        print("  python3 -I riskytensor.py convert <model.pt> [out.riskytensor] [--float32] [--compress]")
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -419,8 +471,6 @@ if __name__ == "__main__":
         }
         n = save(demo, sys.argv[2], recipe="float32")
         print("wrote %d bytes (float32)" % n)
-        loaded = load(sys.argv[2])
-        print("loaded keys:", sorted(loaded.keys()))
         print("verify:", "OK" if verify(sys.argv[2]) else "FAIL")
 
     elif cmd == "roundtrip-int8" and len(sys.argv) == 3:
@@ -444,6 +494,23 @@ if __name__ == "__main__":
         print("raw      %d bytes" % n1)
         print("zlib     %d bytes" % n2)
         print("verify:", "OK" if verify(sys.argv[2]) else "FAIL")
+
+    elif cmd == "convert":
+        if len(sys.argv) < 3:
+            print("Usage: python3 -I riskytensor.py convert <model.pt> [out.riskytensor] [--float32] [--compress]")
+            sys.exit(1)
+        src = sys.argv[2]
+        dst = None
+        recipe = None
+        compress = False
+        for a in sys.argv[3:]:
+            if a == "--float32":
+                recipe = "float32"
+            elif a == "--compress":
+                compress = True
+            elif not a.startswith("-"):
+                dst = a
+        convert(src, out_path=dst, recipe=recipe, compress=compress)
 
     else:
         print("Unknown command or bad arguments")
