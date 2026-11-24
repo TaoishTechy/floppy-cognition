@@ -1,66 +1,85 @@
 # floppy-cognition
 
-**Proto Stage 3–4 cognition core that still fits on a floppy.**
+**Stdlib-only** proto cognition stack (char-level tiny transformer).
+Target envelope: under ~1.4 MB of project code + weights on the critical path.
 
-A 367 k-parameter letter-by-letter transformer that:
-- runs on plain DOS (Turbo C 2.0, 486/Pentium era hardware),
-- needs ~540 KB conventional memory,
-- answers questions from ~3 500 facts in many wordings,
-- exports a 380 KB `TINY.BIN` weight file,
-- is trained and evaluated with a pure-stdlib stack (no torch, no numpy).
+> Pure-Python `laser` + `bumpy` are correct but **slow** (seconds per step/token).
+> Use `--tiny` and small `--bs` for smoke tests.
 
-The entire deliverable (code + weights + documentation) is kept under the hard 1.4 MB budget.
+## Stack
 
-## Goal
-
-Outperform Claude-class models on the exact Tiny held-out fact set while remaining three orders of magnitude smaller and fully offline.
-
-## Stack (stdlib only)
-
-| Module | Role | Status |
-|--------|------|--------|
-| `bumpy.py` | numpy replacement | committed |
-| `laser.py` | torch replacement (Tensor + autograd + nn + AdamW) | source ready locally; full commit pending |
-| `riskytensor.py` | safetensors / torch.save replacement | blueprint only |
-| `train2.py` | model, training, eval, TINY.BIN export | committed |
+| File | Role |
+|------|------|
+| `bumpy.py` | ndarray / matmul (stdlib) |
+| `laser.py` | Tensor + autograd + nn + AdamW (**need full ~49KB local copy if repo has placeholder**) |
+| `train2.py` | train / eval / export |
+| `gen2.py` | facts + `load_digested()` |
+| `riskytensor.py` | RISKY4 container, convert `.pt` → `.riskytensor` |
+| `client.py` | interactive load / generate |
+| `audit.py` | recall / transfer / abstention / calibration |
+| `training/ingest.py` | parse md/json/xml/pdf → RawUnit |
+| `training/digest.py` | DigestedUnit (A1,B7,F36,G37,G38,G41) |
+| `neurotransmitter_module.py` | **SPECULATIVE** 144-heuristic toy model (not clinical) |
 
 ## Quick start
 
 ```bash
-# Bench three model sizes
-python3 -I train2.py bench
+git clone https://github.com/TaoishTechy/floppy-cognition.git
+cd floppy-cognition
 
-# Train a few minutes (uses laser + bumpy)
-python3 -I train2.py train 0.1 smoke.pt
+# If laser.py is a placeholder (~6KB), replace with the full local laser (~1132 lines)
+wc -l laser.py   # expect ~1100+
 
-# Evaluate
-python3 -I train2.py eval smoke.pt
+# Smoke train (tiny model)
+python3 -I train2.py train 5 tiny.pt --tiny --bs 4 --log-every 1 --seed 0
 
-# Export the DOS weight file
-python3 -I train2.py export smoke.pt TINY.BIN
+# Convert + client
+python3 -I riskytensor.py convert tiny.pt tiny.riskytensor
+python3 -I riskytensor.py verify tiny.riskytensor
+python3 -I client.py
+# > /load tiny.riskytensor
+# > what is the capital of france
+
+# Digestion pipeline
+python3 -I training/ingest.py parse training/md/example.md
+python3 -I training/digest.py --limit 20
+python3 -I gen2.py   # should report source: digested if units exist
+
+# Four audits (slow on pure-Python)
+python3 -I audit.py tiny.riskytensor --n 5
+
+# Speculative neurochem self-test
+python3 -I neurotransmitter_module.py
 ```
 
-Copy `TINY.EXE` + `TINY.BIN` to a DOS machine (or emulator) and run.
+## Train flags
 
-## Size contract
+```
+python3 -I train2.py train MINUTES OUT.pt [--tiny] [--bs 4] [--seed N] [--threads N] [--lr 0.002]
+```
 
-- Blueprint document < 100 KB (hard limit 1.4 MB)
-- `bumpy.py` < 40 KB
-- `laser.py` < 55 KB
-- `train2.py` < 16 KB
-- Full model weights (int8 per-row) ~ 380 KB
+- `--tiny` → `D=48 L=2 H=2 HID=96` (fast iteration)
+- default model → `D=96 L=4 H=4 HID=256` (~367k params)
+- Warmup is **5 steps** (not 50)
+- Token/s uses **real** answer-mask counts
 
-All numbers are measured, not claimed.
+## Honest status
 
-## Current repository state
+| Claim | Reality |
+|-------|---------|
+| Pipeline train→convert→load→generate | Works |
+| Fact recall after minutes of pure-Python train | Usually still collapsed (`e` / `.`) |
+| 3500 facts / beat Claude | **Not measured** — do not claim |
+| DOS 540KB runtime | **Not verified** in this tree |
+| `neurotransmitter_module` | Toy / SPECULATIVE only |
 
-See [STATUS.md](STATUS.md) for the exact commit inventory and next actions.
+See `STATUS.md` and `SMOKE.md`.
 
-## Licence
+## Docs
 
-Code: MIT.  
-Three derived data files keep their original licences (see DATA_LICENSES.md in the upstream Tiny tree).
+- `docs/Training-Digestion-Blueprint-V5.0.md`
+- Riskytensor / consolidated blueprints under `docs/` when present
 
----
+## License
 
-*Named floppy-cognition because it still fits on a 1.44 MB floppy and still answers questions.*
+See `LICENSE`.

@@ -1,42 +1,43 @@
-# Smoke-test instructions (pure-Python laser)
+# Smoke-test (pure-Python laser)
 
-The laser backend is pure Python. Large batches take minutes per step and only use ~1 core (GIL).
-
-## 1. Make sure you have the latest trainer
+## Prerequisites
 
 ```bash
-cd ~/Desktop/floppy-cognition-main
-git pull
-# OR copy the latest train2.py from the repo
+wc -l laser.py    # need ~1132 (full), not ~150 (placeholder)
+grep -n "class AdamW" laser.py
+grep -n "pure-Python laser" train2.py
 ```
 
-The banner **must** show:
-```
-batch    4 (pure-Python laser: keep small)
-NOTE     pure-Python backend ~minutes/step at large bs
-```
-If you still see only `model D=96 ... parameters 366528` with no `batch` line, you are on an old train2.py.
+If `laser.py` is a placeholder, copy the full local file before training.
 
-## 2. Run a minimal smoke
+## Minimal train
 
 ```bash
-python3 -I train2.py train 0.05 smoke.pt --bs 2 --log-every 1 --threads 1
+python3 -I train2.py train 2 tiny.pt --tiny --bs 2 --log-every 1 --seed 0
 ```
 
-Expected: a line after **each** step within ~30–90s:
-```
-step    1 |    45s | lr 0.00004 | loss 4.xxxx | 45.0s/step | ETA ...
-```
+Banner must show `batch 2` (or 4) and model `D=48 L=2` when using `--tiny`.
 
-## 3. If it still hangs with no step line
+## Convert / verify / client
 
-- Confirm laser is the full 49KB file: `wc -l laser.py` → ~1132
-- Confirm train2 is new: `grep -n "pure-Python laser" train2.py`
-- Try even smaller:
 ```bash
-python3 -I train2.py train 0.03 smoke.pt --bs 1 --log-every 1
+python3 -I riskytensor.py convert tiny.pt tiny.riskytensor
+python3 -I riskytensor.py verify tiny.riskytensor
+python3 -I client.py
+> /load tiny.riskytensor
+> hello
+```
+
+Expect `generating....` progress. Empty or `eeee`/`....` is normal until longer train.
+
+## Digestion smoke
+
+```bash
+python3 -I training/ingest.py parse training/md/example.md
+python3 -I training/digest.py --limit 20
+python3 -I gen2.py
 ```
 
 ## Why 6% CPU?
 
-CPython’s GIL allows only one thread to execute Python bytecode at a time. laser matmuls are pure Python loops, so extra threads do not help and RSS stays modest (~0.5–1 GB).
+CPython GIL: laser matmuls are pure Python → one core. Extra threads do not speed the hot path.
