@@ -1,12 +1,11 @@
 """Train TINY version 2 (laser + bumpy, no torch / numpy).
 
   python3 -I train2.py bench
-  python3 -I train2.py train MINUTES OUT.pt [--bs 4] [--threads N] [--seed N]
+  python3 -I train2.py train MINUTES OUT.pt [--bs 4] [--tiny] [--threads N] [--seed N]
   python3 -I train2.py eval  MODEL.pt [show]
   python3 -I train2.py export MODEL.pt TINY.BIN
 
-NOTE: laser is pure-Python. A step with bs=64 takes minutes.
-Default bs=4 so smoke runs finish in reasonable time.
+NOTE: laser is pure-Python. Default bs=4. Use --tiny for fast iteration.
 """
 import sys, os, time, math, random, struct, re, collections, threading, queue, gc
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -175,7 +174,7 @@ class BatchProducer:
         for _ in range(self.bs * 8):
             q, a, _ = gen2.sample(self.rng)
             ids = encode(q + '\n' + a + '\n')[:CTX]
-            mask = [0] * (len(q) + 1) + [1] * (len(ids) - len(q) - 1)
+            mask = [0] * (len(q) + 1) + [1] * max(0, len(ids) - len(q) - 1)
             ex.append((ids, mask))
         ex.sort(key=lambda e: len(e[0]))
         chunks = [ex[i:i + self.bs] for i in range(0, len(ex), self.bs)]
@@ -231,7 +230,7 @@ def batch(rng, n):
         for _ in range(n * 16):
             q, a, _ = gen2.sample(rng)
             ids = encode(q + '\n' + a + '\n')[:CTX]
-            mask = [0] * (len(q) + 1) + [1] * (len(ids) - len(q) - 1)
+            mask = [0] * (len(q) + 1) + [1] * max(0, len(ids) - len(q) - 1)
             ex.append((ids, mask))
         ex.sort(key=lambda e: len(e[0]))
         chunks = [ex[i:i + n] for i in range(0, len(ex), n)]
@@ -251,7 +250,7 @@ def loss_fn(model, x, m):
     logits = model(x[:, :-1])
     l = F.cross_entropy(logits.reshape(-1, VOCAB), x[:, 1:].reshape(-1), reduction='none')
     w = m[:, 1:].reshape(-1)
-    return (l * w).sum() / w.sum()
+    return (l * w).sum() / w.sum().clamp_min(1e-8)
 
 
 STOP = set('a an the it is are was of in on and to its it\'s they there people speak use money capital city '
@@ -264,7 +263,6 @@ def words_of(s):
 
 
 def eval_set(n_per_kind=20, seed=123):
-    """Smaller default eval set for pure-Python speed."""
     rng = random.Random(seed)
     out = []
     for f in [f for f in gen2.TXT if f.get('test_q')]:
@@ -310,28 +308,20 @@ def correct(q, gen, refs, kind=None):
 def answer_many(model, qs):
     model.eval()
     res = {}
-    bylen = collections.defaultdict(list)
     for q in qs:
-        bylen[len(q)].append(q)
-    for n, group in bylen.items():
-        x = torch.tensor([encode(q + '\n') for q in group])
-        done = [False] * len(group)
-        outs = [[] for _ in group]
-        # Cap generation length for speed
-        max_new = min(32, CTX - x.shape[1])
+        prompt = q + '\n'
+        if len(prompt) > CTX - 32:
+            prompt = prompt[-(CTX - 32):]
+        x = torch.tensor([encode(prompt)])
+        outs = []
+        max_new = max(0, min(32, CTX - x.shape[1]))
         for _ in range(max_new):
-            if all(done):
+            nxt = int(model(x)[:, -1].argmax(-1).item())
+            if nxt <= 1:
                 break
-            nxt = model(x)[:, -1].argmax(-1)
-            for i, t in enumerate(nxt.tolist()):
-                if not done[i]:
-                    if t <= 1:
-                        done[i] = True
-                    else:
-                        outs[i].append(t)
-            x = torch.cat([x, nxt[:, None]], 1)
-        for q, o in zip(group, outs):
-            res[q] = decode(o)
+            outs.append(nxt)
+            x = torch.cat([x, torch.tensor([[nxt]])], 1)
+        res[q] = decode(outs)
     model.train()
     return res
 
@@ -409,7 +399,7 @@ def load_model(path):
             emb = sd.get('emb.weight')
             D = emb.shape[1] if emb is not None else 96
             cfg_dict = {'D': D, 'L': 4, 'H': 4, 'HID': 256}
-        m = Model(Cfg(**cfg_dict))
+        m = Model(Cfg(**{k: cfg_dict[k] for k in ('D', 'L', 'H', 'HID') if k in cfg_dict}))
         m.load_state_dict(sd)
         return m
     ck = torch.load(path, map_location='cpu')
@@ -430,7 +420,6 @@ def save_model(m, path):
 def train(minutes, out, start=None, cfg=Cfg(), peak=2e-3, bs=4, log_every=1,
           resume=None, decay_frac=None, eval_every=0, seed=None, threads=None,
           skip_final_eval=None):
-    """Train. Default bs=4 for pure-Python laser speed."""
     if threads is not None:
         torch.set_num_threads(int(threads))
     n_threads = torch.get_num_threads() if hasattr(torch, 'get_num_threads') else _DEFAULT_THREADS
@@ -482,7 +471,7 @@ def train(minutes, out, start=None, cfg=Cfg(), peak=2e-3, bs=4, log_every=1,
             if el >= total:
                 break
 
-            warm = min(1.0, (step + 1) / 50)
+            warm = min(1.0, (step + 1) / 5)  # short runs need peak LR early
             if decay_frac is None:
                 lr = peak * warm * (0.03 + 0.97 * 0.5 * (1 + math.cos(math.pi * el / total)))
             else:
@@ -502,10 +491,11 @@ def train(minutes, out, start=None, cfg=Cfg(), peak=2e-3, bs=4, log_every=1,
             step_dt = time.time() - step_t0
 
             loss_val = float(loss.item()) if hasattr(loss, 'item') else float(loss)
+            tok_step = int(msk.sum().item()) if hasattr(msk, 'sum') else int(x.numel())
             del x, msk, loss
 
             step += 1
-            tokens_seen += bs * 40
+            tokens_seen += tok_step
 
             if step % log_every == 0:
                 eta = max(0.0, total - el)
@@ -541,7 +531,7 @@ if __name__ == '__main__':
 
     if cmd == 'bench':
         rng = random.Random(0)
-        for c in [Cfg(64, 2, 4, 128), Cfg(96, 3, 4, 192)]:
+        for c in [Cfg(48, 2, 2, 96), Cfg(64, 2, 4, 128), Cfg(96, 3, 4, 192)]:
             m = Model(c)
             opt = torch.optim.AdamW(m.parameters(), lr=1e-3)
             for i in range(5):
@@ -557,6 +547,7 @@ if __name__ == '__main__':
 
     elif cmd == 'train':
         minutes = float(sys.argv[2])
+        cfg = Cfg(48, 2, 2, 96) if '--tiny' in sys.argv else Cfg()
         m = train(
             minutes, sys.argv[3],
             start=arg('--from'),
@@ -568,8 +559,8 @@ if __name__ == '__main__':
             threads=int(arg('--threads')) if arg('--threads') else None,
             bs=int(arg('--bs', 4)),
             log_every=int(arg('--log-every', 1)),
+            cfg=cfg,
         )
-        # Only run full eval if training was long enough
         if minutes >= 2.0:
             print('\n--- final evaluation (this is slow on pure-Python) ---', flush=True)
             tot, line = evaluate(m, show=5)
@@ -579,15 +570,15 @@ if __name__ == '__main__':
 
     elif cmd == 'eval':
         m = load_model(sys.argv[2])
-        show = int(sys.argv[3]) if len(sys.argv) > 3 else 10
+        show = int(sys.argv[3]) if len(sys.argv) > 3 else 0
         tot, line = evaluate(m, show=show)
         print('eval %.1f%%  %s' % (100 * tot, line))
 
     elif cmd == 'export':
-        n = export(load_model(sys.argv[2]), sys.argv[3])
-        print('wrote', n, 'bytes')
+        m = load_model(sys.argv[2])
+        n = export(m, sys.argv[3])
+        print('wrote', sys.argv[3], n, 'bytes')
 
     else:
-        print('unknown command:', cmd)
         print(__doc__)
         sys.exit(1)
