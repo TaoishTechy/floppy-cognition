@@ -1,20 +1,12 @@
-"""Simple interactive client for floppy-cognition models and riskytensor files.
-
-Usage:
-  python3 -I client.py
-  python3 -I client.py MODEL.pt|MODEL.riskytensor|TINY.BIN
-  python3 -I client.py --info FILE.riskytensor
-  python3 -I client.py --verify FILE.riskytensor
-  python3 -I client.py --convert MODEL.pt [OUT.riskytensor]
-"""
+"""Simple interactive client for floppy-cognition models and riskytensor files."""
 import sys
 import os
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Keep generation short — pure-Python laser is ~seconds per token
 MAX_NEW_TOKENS = 16
+CTX = 128
 
 
 def _load_model(path):
@@ -22,13 +14,29 @@ def _load_model(path):
     return train2.load_model(path)
 
 
+def _prepare_prompt(question):
+    """Truncate prompt so prompt + max_new fits in CTX. Returns (fed_string, truncated)."""
+    # reserve room for generation
+    budget = CTX - MAX_NEW_TOKENS - 1  # -1 for the newline we append
+    q = question
+    truncated = False
+    if len(q) > budget:
+        q = q[-budget:]
+        truncated = True
+    return q, truncated
+
+
 def _generate(model, question, max_new=MAX_NEW_TOKENS):
-    """Greedy decode with live progress (avoids silent multi-minute hangs)."""
     import train2
     import laser as torch
 
+    fed, truncated = _prepare_prompt(question)
+    if truncated:
+        print('  [warn] prompt truncated to last %d chars (CTX=%d)' % (len(fed), CTX), flush=True)
+    print('  [fed] len=%d  %r' % (len(fed), fed[:60] + ('...' if len(fed) > 60 else '')), flush=True)
+
     model.eval()
-    ids = train2.encode(question + '\n')
+    ids = train2.encode(fed + '\n')
     x = torch.tensor([ids])
     out = []
     t0 = time.time()
@@ -37,12 +45,12 @@ def _generate(model, question, max_new=MAX_NEW_TOKENS):
         for step in range(max_new):
             logits = model(x)
             nxt = int(logits[0, -1].argmax(-1).item())
-            if nxt <= 1:  # newline / stop
+            if nxt <= 1:
                 break
             out.append(nxt)
             x = torch.cat([x, torch.tensor([[nxt]])], 1)
             print('.', end='', flush=True)
-        print(' done (%.1fs)' % (time.time() - t0), flush=True)
+        print(' done (%.1fs, %d toks)' % (time.time() - t0, len(out)), flush=True)
     except Exception as e:
         print(' error: %s' % e, flush=True)
     finally:
@@ -60,14 +68,14 @@ def interactive(model_path=None):
 
     print()
     print('floppy-cognition client')
-    print('  /load PATH     load a model (.pt / .riskytensor / .BIN)')
-    print('  /info PATH     show riskytensor manifest')
-    print('  /verify PATH   verify riskytensor integrity')
-    print('  /convert SRC [DST]  convert .pt -> .riskytensor')
-    print('  /eval [N]      run evaluate() and show N failures')
-    print('  /quit          exit')
-    print('  anything else  asked as a question (max %d new tokens)' % MAX_NEW_TOKENS)
-    print('  NOTE: pure-Python laser ~seconds/token; be patient')
+    print('  /load PATH     load a model')
+    print('  /info PATH     riskytensor manifest')
+    print('  /verify PATH   verify riskytensor')
+    print('  /convert SRC [DST]')
+    print('  /eval [N]      evaluate (slow)')
+    print('  /quit')
+    print('  other text     generate (max %d new tokens)' % MAX_NEW_TOKENS)
+    print('  NOTE: pure-Python laser ~seconds/token')
     print()
 
     while True:
@@ -136,7 +144,7 @@ def interactive(model_path=None):
                     show = int(bits[1])
                 except ValueError:
                     pass
-            print('evaluating (slow on pure-Python)...', flush=True)
+            print('evaluating (slow)...', flush=True)
             import train2
             tot, report = train2.evaluate(model, show=show)
             print('eval %.1f%%  %s' % (100 * tot, report), flush=True)
@@ -147,35 +155,29 @@ def interactive(model_path=None):
             continue
 
         answer = _generate(model, line)
-        print('  -> %s' % (answer if answer else '(empty)'), flush=True)
+        print('  -> %s' % (answer if answer else '(empty / immediate EOS)'), flush=True)
 
 
 def main():
     if len(sys.argv) == 1:
         interactive()
         return
-
     if sys.argv[1] == '--info' and len(sys.argv) == 3:
         import riskytensor, json
         m = riskytensor.info(sys.argv[2])
         m.pop('_payload_sha', None)
         print(json.dumps(m, indent=2))
         return
-
     if sys.argv[1] == '--verify' and len(sys.argv) == 3:
         import riskytensor
         sys.exit(0 if riskytensor.verify(sys.argv[2]) else 1)
-
     if sys.argv[1] == '--convert':
         import riskytensor
         if len(sys.argv) < 3:
             print('usage: client.py --convert MODEL.pt [OUT.riskytensor]')
             sys.exit(1)
-        src = sys.argv[2]
-        dst = sys.argv[3] if len(sys.argv) > 3 else None
-        riskytensor.convert(src, out_path=dst)
+        riskytensor.convert(sys.argv[2], out_path=sys.argv[3] if len(sys.argv) > 3 else None)
         return
-
     interactive(sys.argv[1])
 
 
