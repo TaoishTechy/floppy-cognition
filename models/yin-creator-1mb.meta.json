@@ -1,0 +1,11 @@
+{
+  "path": "models/yin-creator-1mb.riskytensor",
+  "bytes": 1057033,
+  "MiB": 1.008,
+  "cfg": {"D": 128, "L": 6, "H": 4, "HID": 384},
+  "params_measured": 1013504,
+  "user": "Creator",
+  "entity": "Yin",
+  "identity_pairs": 14,
+  "linguistics_pairs": 30
+}

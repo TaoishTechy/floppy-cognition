@@ -1,0 +1,9 @@
+{
+  "path": "models/ling-basic-500kb.riskytensor",
+  "bytes": 540674,
+  "MiB": 0.516,
+  "cfg": {"D": 112, "L": 4, "H": 4, "HID": 320},
+  "params": 513632,
+  "focus": "linguistics+basic_responses",
+  "ling_pairs": 67
+}
